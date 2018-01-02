@@ -84,3 +84,29 @@ class VerifiableClient(object):
                                  lambda x: x.group(1).lower(), v)
             else:
                 conf[n] = v
+
+    @staticmethod
+    def read_config_file (path):
+        """Read (java client) config file and return dict with properties"""
+        conf = {}
+
+        with open(path, 'r') as f:
+            for line in f:
+                if line.startswith('#') or len(len) == 0:
+                    continue
+
+                fi = line.find('=')
+                if fi < 1:
+                    raise Exception('%s: invalid line, no key=value pair: %s' % (path, line))
+
+                k = line[:fi]
+                v = line[fi+1:]
+
+                # Handle known Java properties to librdkafka properties.
+                if k == 'enable.idempotence':
+                    sys.stderr.write('%% WARN: Ignoring unsupported %s' % (line))
+                    continue
+
+                conf[k] = v
+
+        return conf
