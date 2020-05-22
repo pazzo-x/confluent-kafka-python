@@ -19,3 +19,10 @@ tmp-build
 wheelhouse
 dl-*
 *.whl
+.pytest_cache
+staging
+tests/docker/conf/tls/*
+.python-version
+.DS_Store
+.idea
+tmp-KafkaCluster

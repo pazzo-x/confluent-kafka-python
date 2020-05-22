@@ -45,7 +45,7 @@ if __name__ == '__main__':
         if err:
             sys.stderr.write('%% Message failed delivery: %s\n' % err)
         else:
-            sys.stderr.write('%% Message delivered to %s [%d] @ %o\n' %
+            sys.stderr.write('%% Message delivered to %s [%d] @ %d\n' %
                              (msg.topic(), msg.partition(), msg.offset()))
 
     # Read lines from stdin, produce each line to Kafka
@@ -54,7 +54,7 @@ if __name__ == '__main__':
             # Produce line (without newline)
             p.produce(topic, line.rstrip(), callback=delivery_callback)
 
-        except BufferError as e:
+        except BufferError:
             sys.stderr.write('%% Local producer queue is full (%d messages awaiting delivery): try again\n' %
                              len(p))
 

@@ -45,6 +45,12 @@ class TestCacheSchemaRegistryClient(unittest.TestCase):
         self.assertTrue(schema_id > 0)
         self.assertEqual(len(client.id_to_schema), 1)
 
+    def test_check_registration(self):
+        parsed = avro.loads(data_gen.BASIC_SCHEMA)
+        client = self.client
+        schema_id = client.register('test', parsed)
+        self.assertEqual(schema_id, client.check_registration('test', parsed))
+
     def test_multi_subject_register(self):
         parsed = avro.loads(data_gen.BASIC_SCHEMA)
         client = self.client
@@ -125,3 +131,114 @@ class TestCacheSchemaRegistryClient(unittest.TestCase):
 
     def hash_func(self):
         return hash(str(self))
+
+    def test_cert_no_key(self):
+        with self.assertRaises(ValueError):
+            self.client = CachedSchemaRegistryClient(url='https://127.0.0.1:65534',
+                                                     cert_location='/path/to/cert')
+
+    def test_cert_with_key(self):
+        self.client = CachedSchemaRegistryClient(url='https://127.0.0.1:65534',
+                                                 cert_location='/path/to/cert',
+                                                 key_location='/path/to/key')
+        self.assertTupleEqual(('/path/to/cert', '/path/to/key'), self.client._session.cert)
+
+    def test_cert_path(self):
+        self.client = CachedSchemaRegistryClient(url='https://127.0.0.1:65534',
+                                                 ca_location='/path/to/ca')
+        self.assertEqual('/path/to/ca', self.client._session.verify)
+
+    def test_context(self):
+        with self.client as c:
+            parsed = avro.loads(data_gen.BASIC_SCHEMA)
+            schema_id = c.register('test', parsed)
+            self.assertTrue(schema_id > 0)
+            self.assertEqual(len(c.id_to_schema), 1)
+
+    def test_init_with_dict(self):
+        self.client = CachedSchemaRegistryClient({
+            'url': 'https://127.0.0.1:65534',
+            'ssl.certificate.location': '/path/to/cert',
+            'ssl.key.location': '/path/to/key'
+        })
+        self.assertEqual('https://127.0.0.1:65534', self.client.url)
+
+    def test_empty_url(self):
+        with self.assertRaises(ValueError):
+            self.client = CachedSchemaRegistryClient({
+                'url': ''
+            })
+
+    def test_invalid_type_url(self):
+        with self.assertRaises(TypeError):
+            self.client = CachedSchemaRegistryClient(
+                url=1)
+
+    def test_invalid_type_url_dict(self):
+        with self.assertRaises(TypeError):
+            self.client = CachedSchemaRegistryClient({
+                "url": 1
+                })
+
+    def test_invalid_url(self):
+        with self.assertRaises(ValueError):
+            self.client = CachedSchemaRegistryClient({
+                'url': 'example.com:65534'
+            })
+
+    def test_trailing_slash_removal(self):
+        self.client = CachedSchemaRegistryClient({
+            'url': 'http://127.0.0.1:65534/'
+        })
+        self.assertEqual(self.client.url, "http://127.0.0.1:65534")
+
+    def test_basic_auth_url(self):
+        self.client = CachedSchemaRegistryClient({
+            'url': 'https://user_url:secret_url@127.0.0.1:65534',
+        })
+        self.assertTupleEqual(('user_url', 'secret_url'), self.client._session.auth)
+
+    def test_basic_auth_userinfo(self):
+        self.client = CachedSchemaRegistryClient({
+            'url': 'https://user_url:secret_url@127.0.0.1:65534',
+            'basic.auth.credentials.source': 'user_info',
+            'basic.auth.user.info': 'user_userinfo:secret_userinfo'
+        })
+        self.assertTupleEqual(('user_userinfo', 'secret_userinfo'), self.client._session.auth)
+
+    def test_basic_auth_sasl_inherit(self):
+        self.client = CachedSchemaRegistryClient({
+            'url': 'https://user_url:secret_url@127.0.0.1:65534',
+            'basic.auth.credentials.source': 'SASL_INHERIT',
+            'sasl.mechanism': 'PLAIN',
+            'sasl.username': 'user_sasl',
+            'sasl.password': 'secret_sasl'
+        })
+        self.assertTupleEqual(('user_sasl', 'secret_sasl'), self.client._session.auth)
+
+    def test_basic_auth_sasl_inherit_invalid(self):
+        with self.assertRaises(ValueError) as e:
+            self.client = CachedSchemaRegistryClient({
+                'url': 'https://user_url:secret_url@127.0.0.1:65534',
+                'basic.auth.credentials.source': 'SASL_INHERIT',
+                'sasl.mechanism': 'gssapi'  # also test the .upper()
+            })
+        self.assertEqual(str(e.exception), "SASL_INHERIT does not support SASL mechanism GSSAPI")
+
+    def test_basic_auth_invalid(self):
+        with self.assertRaises(ValueError):
+            self.client = CachedSchemaRegistryClient({
+                'url': 'https://user_url:secret_url@127.0.0.1:65534',
+                'basic.auth.credentials.source': 'VAULT',
+            })
+
+    def test_invalid_conf(self):
+        with self.assertRaises(ValueError):
+            self.client = CachedSchemaRegistryClient({
+                'url': 'https://user_url:secret_url@127.0.0.1:65534',
+                'basic.auth.credentials.source': 'SASL_INHERIT',
+                'sasl.username': 'user_sasl',
+                'sasl.password': 'secret_sasl',
+                'invalid.conf': 1,
+                'invalid.conf2': 2
+            })

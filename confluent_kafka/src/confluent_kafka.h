@@ -18,8 +18,31 @@
 #include <structmember.h>
 #include <pythread.h>
 
+#include <stdint.h>
 #include <librdkafka/rdkafka.h>
 
+#ifdef _MSC_VER
+/* Windows */
+#define CFL_PRId64 "I64d"
+#define CFL_PRId32 "I32d"
+
+#else
+/* C99 */
+#include <inttypes.h>
+#define CFL_PRId64 PRId64
+#define CFL_PRId32 PRId32
+#endif
+
+
+/**
+ * @brief confluent-kafka-python version, must match that of setup.py.
+ *
+ * Hex version representation:
+ *  0xMMmmRRPP
+ *  MM=major, mm=minor, RR=revision, PP=patchlevel (not used)
+ */
+#define CFL_VERSION     0x01040200
+#define CFL_VERSION_STR "1.4.2"
 
 /**
  * Minimum required librdkafka version. This is checked both during
@@ -27,19 +50,19 @@
  * Make sure to keep the MIN_RD_KAFKA_VERSION, MIN_VER_ERRSTR and #error
  * defines and strings in sync.
  */
-#define MIN_RD_KAFKA_VERSION 0x00090100
+#define MIN_RD_KAFKA_VERSION 0x01040000
 
 #ifdef __APPLE__
-#define MIN_VER_ERRSTR "confluent-kafka-python requires librdkafka v0.9.1 or later. Install the latest version of librdkafka from Homebrew by running `brew install librdkafka` or `brew upgrade librdkafka`"
+#define MIN_VER_ERRSTR "confluent-kafka-python requires librdkafka v1.4.0 or later. Install the latest version of librdkafka from Homebrew by running `brew install librdkafka` or `brew upgrade librdkafka`"
 #else
-#define MIN_VER_ERRSTR "confluent-kafka-python requires librdkafka v0.9.1 or later. Install the latest version of librdkafka from the Confluent repositories, see http://docs.confluent.io/current/installation.html"
+#define MIN_VER_ERRSTR "confluent-kafka-python requires librdkafka v1.4.0 or later. Install the latest version of librdkafka from the Confluent repositories, see http://docs.confluent.io/current/installation.html"
 #endif
 
 #if RD_KAFKA_VERSION < MIN_RD_KAFKA_VERSION
 #ifdef __APPLE__
-#error "confluent-kafka-python requires librdkafka v0.9.1 or later. Install the latest version of librdkafka from Homebrew by running `brew install librdkafka` or `brew upgrade librdkafka`"
+#error "confluent-kafka-python requires librdkafka v1.4.0 or later. Install the latest version of librdkafka from Homebrew by running `brew install librdkafka` or `brew upgrade librdkafka`"
 #else
-#error "confluent-kafka-python requires librdkafka v0.9.1 or later. Install the latest version of librdkafka from the Confluent repositories, see http://docs.confluent.io/current/installation.html"
+#error "confluent-kafka-python requires librdkafka v1.4.0 or later. Install the latest version of librdkafka from the Confluent repositories, see http://docs.confluent.io/current/installation.html"
 #endif
 #endif
 
@@ -47,8 +70,22 @@
 #if PY_MAJOR_VERSION >= 3
 #define PY3
 #include <bytesobject.h>
+
+ #if PY_MINOR_VERSION >= 7
+  #define WITH_PY_TSS
+ #endif
 #endif
 
+/**
+ * Avoid unused function warnings
+ */
+#if _WIN32
+#define CFL_UNUSED
+#define CFL_INLINE __inline
+#else
+#define CFL_UNUSED __attribute__((unused))
+#define CFL_INLINE __inline
+#endif
 
 /**
  * librdkafka feature detection
@@ -108,9 +145,28 @@ cfl_PyUnistr_AsUTF8 (PyObject *o, PyObject **uobjp) {
 /* See comments above */
 #define cfl_PyBin(X)    PyString ## X
 #define cfl_PyUnistr(X) PyUnicode ## X
+
+/**
+ * @returns NULL if object \p can't be represented as UTF8, else a temporary
+ *          char string with a lifetime equal of \p o and \p uobjp
+ */
 static __inline const char *
 cfl_PyUnistr_AsUTF8 (PyObject *o, PyObject **uobjp) {
-        *uobjp = PyUnicode_AsUTF8String(o); /*UTF8 intermediary object on Py2*/
+        if (!PyUnicode_Check(o)) {
+                PyObject *uo;
+                if (!(uo = PyUnicode_FromObject(o))) {
+                        *uobjp = NULL;
+                        return NULL;
+                }
+                /*UTF8 intermediary object on Py2*/
+                *uobjp = PyUnicode_AsUTF8String(o);
+                Py_DECREF(uo);
+        } else {
+                /*UTF8 intermediary object on Py2*/
+                *uobjp = PyUnicode_AsUTF8String(o);
+        }
+        if (!*uobjp)
+                return NULL;
         return PyBytes_AsString(*uobjp);
 }
 #define cfl_PyObject_Unistr(X) PyObject_Unicode(X)
@@ -130,7 +186,7 @@ extern PyObject *KafkaException;
 
 PyObject *KafkaError_new0 (rd_kafka_resp_err_t err, const char *fmt, ...);
 PyObject *KafkaError_new_or_None (rd_kafka_resp_err_t err, const char *str);
-
+PyObject *KafkaError_new_from_error_destroy (rd_kafka_error_t *error);
 
 /**
  * @brief Raise an exception using KafkaError.
@@ -140,9 +196,16 @@ PyObject *KafkaError_new_or_None (rd_kafka_resp_err_t err, const char *str);
 #define cfl_PyErr_Format(err,...) do {					\
 		PyObject *_eo = KafkaError_new0(err, __VA_ARGS__);	\
 		PyErr_SetObject(KafkaException, _eo);			\
-		Py_DECREF(_eo); \
 	} while (0)
 
+/**
+ * @brief Create a Python exception from an rd_kafka_error_t *
+ *        and destroy it the C object when done.
+ */
+#define cfl_PyErr_from_error_destroy(error) do {                        \
+		PyObject *_eo = KafkaError_new_from_error_destroy(error); \
+		PyErr_SetObject(KafkaException, _eo);			\
+	} while (0)
 
 
 /****************************************************************************
@@ -158,10 +221,20 @@ typedef struct {
 	PyObject_HEAD
 	rd_kafka_t *rk;
 	PyObject *error_cb;
+	PyObject *throttle_cb;
 	PyObject *stats_cb;
         int initiated;
-        int tlskey;  /* Thread-Local-Storage key */
+
+        /* Thread-Local-Storage key */
+#ifdef WITH_PY_TSS
+        Py_tss_t tlskey;
+#else
+        int tlskey;
+#endif
+
         rd_kafka_type_t type; /* Producer or consumer */
+
+        PyObject *logger;
 
 	union {
 		/**
@@ -169,12 +242,6 @@ typedef struct {
 		 */
 		struct {
 			PyObject *default_dr_cb;
-			PyObject *partitioner_cb; /**< Registered Python partitioner */
-			int32_t (*c_partitioner_cb) (
-				const rd_kafka_topic_t *,
-				const void *, size_t, int32_t,
-				void *, void *);  /**< Fallback C partitioner*/
-
                         int dr_only_error; /**< delivery.report.only.error */
 		} Producer;
 
@@ -231,6 +298,40 @@ void CallState_resume (CallState *cs);
 void CallState_crash (CallState *cs);
 
 
+/**
+ * @brief Python 3 renamed the internal PyInt type to PyLong, but the
+ *        type is still exposed as 'int' in Python.
+ *        We use the (cfl_)PyInt name for both Python 2 and 3 to mean an int,
+ *        assuming it will be at least 31 bits+signed on all platforms.
+ */
+#ifdef PY3
+#define cfl_PyInt_Check(o) PyLong_Check(o)
+#define cfl_PyInt_AsInt(o) (int)PyLong_AsLong(o)
+#define cfl_PyInt_FromInt(v) PyLong_FromLong(v)
+#else
+#define cfl_PyInt_Check(o) PyInt_Check(o)
+#define cfl_PyInt_AsInt(o) (int)PyInt_AsLong(o)
+#define cfl_PyInt_FromInt(v) PyInt_FromLong(v)
+#endif
+
+
+PyObject *cfl_PyObject_lookup (const char *modulename, const char *typename);
+
+void cfl_PyDict_SetString (PyObject *dict, const char *name, const char *val);
+void cfl_PyDict_SetInt (PyObject *dict, const char *name, int val);
+int cfl_PyObject_SetString (PyObject *o, const char *name, const char *val);
+int cfl_PyObject_SetInt (PyObject *o, const char *name, int val);
+int cfl_PyObject_GetAttr (PyObject *object, const char *attr_name,
+                          PyObject **valp, const PyTypeObject *py_type,
+                          int required);
+int cfl_PyObject_GetInt (PyObject *object, const char *attr_name, int *valp,
+                         int defval, int required);
+int cfl_PyObject_GetString (PyObject *object, const char *attr_name,
+                            char **valp, const char *defval, int required);
+int cfl_PyBool_get (PyObject *object, const char *name, int *valp);
+
+PyObject *cfl_int32_array_to_py_list (const int32_t *arr, size_t cnt);
+
 /****************************************************************************
  *
  *
@@ -260,12 +361,30 @@ extern PyTypeObject TopicPartitionType;
  *
  *
  ****************************************************************************/
+#define PY_RD_KAFKA_ADMIN  100 /* There is no Admin client type in librdkafka,
+                                * so we use the producer type for now,
+                                * but we need to differentiate between a
+                                * proper producer and an admin client in the
+                                * python code in some places. */
 rd_kafka_conf_t *common_conf_setup (rd_kafka_type_t ktype,
 				    Handle *h,
 				    PyObject *args,
 				    PyObject *kwargs);
 PyObject *c_parts_to_py (const rd_kafka_topic_partition_list_t *c_parts);
 rd_kafka_topic_partition_list_t *py_to_c_parts (PyObject *plist);
+PyObject *list_topics (Handle *self, PyObject *args, PyObject *kwargs);
+
+
+extern const char list_topics_doc[];
+
+
+#ifdef RD_KAFKA_V_HEADERS
+rd_kafka_headers_t *py_headers_to_c (PyObject *hdrs);
+PyObject *c_headers_to_py (rd_kafka_headers_t *headers);
+#endif
+
+PyObject *c_cgmd_to_py (const rd_kafka_consumer_group_metadata_t *cgmd);
+rd_kafka_consumer_group_metadata_t *py_to_c_cgmd (PyObject *obj);
 
 
 /****************************************************************************
@@ -286,6 +405,10 @@ typedef struct {
 	PyObject *topic;
 	PyObject *value;
 	PyObject *key;
+	PyObject *headers;
+#ifdef RD_KAFKA_V_HEADERS
+	rd_kafka_headers_t *c_headers;
+#endif
 	PyObject *error;
 	int32_t partition;
 	int64_t offset;
@@ -311,14 +434,11 @@ PyObject *Message_error (Message *self, PyObject *ignore);
 
 extern PyTypeObject ProducerType;
 
-
-int32_t Producer_partitioner_cb (const rd_kafka_topic_t *rkt,
-				 const void *keydata,
-				 size_t keylen,
-				 int32_t partition_cnt,
-				 void *rkt_opaque, void *msg_opaque);
-
-
+static CFL_UNUSED CFL_INLINE int cfl_timeout_ms(double tmout) {
+        if (tmout < 0)
+                return -1;
+        return (int)(tmout * 1000);
+}
 /****************************************************************************
  *
  *
@@ -330,3 +450,50 @@ int32_t Producer_partitioner_cb (const rd_kafka_topic_t *rkt,
  ****************************************************************************/
 
 extern PyTypeObject ConsumerType;
+
+
+/****************************************************************************
+ *
+ *
+ * AdminClient types
+ *
+ *
+ *
+ *
+ ****************************************************************************/
+
+typedef struct {
+        PyObject_HEAD
+        char *topic;
+        int   num_partitions;
+        int   replication_factor;
+        PyObject *replica_assignment;  /**< list<int> */
+        PyObject *config;              /**< dict<str,str> */
+} NewTopic;
+
+extern PyTypeObject NewTopicType;
+
+
+typedef struct {
+        PyObject_HEAD
+        char *topic;
+        int   new_total_count;
+        PyObject *replica_assignment;
+} NewPartitions;
+
+extern PyTypeObject NewPartitionsType;
+
+int AdminTypes_Ready (void);
+void AdminTypes_AddObjects (PyObject *m);
+
+/****************************************************************************
+ *
+ *
+ * AdminClient
+ *
+ *
+ *
+ *
+ ****************************************************************************/
+
+extern PyTypeObject AdminType;

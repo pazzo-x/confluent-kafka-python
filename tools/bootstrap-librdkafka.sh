@@ -10,33 +10,36 @@ if [[ $1 == "--require-ssl" ]]; then
 fi
 
 VERSION=$1
-PREFIXDIR=$2
+INSTALLDIR=$2
+BUILDDIR=$PWD/tmp-build
 
-set -e
+set -ex
+set -o pipefail
 
 if [[ -z "$VERSION" ]]; then
     echo "Usage: $0 --require-ssl <librdkafka-version> [<install-dir>]" 1>&2
     exit 1
 fi
 
-if [[ -z "$PREFIXDIR" ]]; then
-    PREFIXDIR=tmp-build
+if [[ $INSTALLDIR != /* ]]; then
+    INSTALLDIR="$PWD/$INSTALLDIR"
 fi
 
-if [[ $PREFIXDIR != /* ]]; then
-    PREFIXDIR="$PWD/$PREFIXDIR"
-fi
-
-mkdir -p "$PREFIXDIR/librdkafka"
-pushd "$PREFIXDIR/librdkafka"
+mkdir -p "$BUILDDIR/librdkafka"
+pushd "$BUILDDIR/librdkafka"
 
 test -f configure ||
-curl -L "https://github.com/edenhill/librdkafka/archive/${VERSION}.tar.gz" | \
+curl -q -L "https://github.com/edenhill/librdkafka/archive/${VERSION}.tar.gz" | \
     tar -xz --strip-components=1 -f -
 
 ./configure --clean
 make clean
-./configure --prefix="$PREFIXDIR"
+
+if [[ $OSTYPE == "linux"* ]]; then
+  EXTRA_OPTS="--disable-gssapi"
+fi
+
+./configure --enable-static --install-deps --source-deps-only $EXTRA_OPTS --prefix="$INSTALLDIR"
 
 if [[ $REQUIRE_SSL == 1 ]]; then
     grep '^#define WITH_SSL 1$' config.h || \
@@ -44,6 +47,12 @@ if [[ $REQUIRE_SSL == 1 ]]; then
 fi
 
 make -j
-make install
+examples/rdkafka_example -X builtin.features
+
+if [[ $INSTALLDIR == /usr && $(whoami) != root ]]; then
+    sudo make install
+else
+    make install
+fi
 popd
 

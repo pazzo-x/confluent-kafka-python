@@ -46,9 +46,6 @@ fi
 echo "# Installing basic system dependencies"
 yum install -y zlib-devel gcc-c++
 
-# Build OpenSSL
-$(dirname $0)/build-openssl.sh /usr
-
 echo "# Building librdkafka ${LIBRDKAFKA_VERSION}"
 $(dirname $0)/bootstrap-librdkafka.sh --require-ssl ${LIBRDKAFKA_VERSION} /usr
 
@@ -78,7 +75,7 @@ done
 echo "# Installing wheels"
 for PYBIN in /opt/python/*/bin/; do
     echo "## Installing $PYBIN"
-    "${PYBIN}/pip" install confluent_kafka --no-index -f /io/wheelhouse
+    "${PYBIN}/pip" install confluent_kafka -f /io/wheelhouse
     "${PYBIN}/python" -c 'import confluent_kafka; print(confluent_kafka.libversion())'
     echo "## Uninstalling $PYBIN"
     "${PYBIN}/pip" uninstall -y confluent_kafka

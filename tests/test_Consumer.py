@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
-from confluent_kafka import (Consumer, TopicPartition, KafkaError, KafkaException, TIMESTAMP_NOT_AVAILABLE,
+from confluent_kafka import (Consumer, TopicPartition, KafkaError,
+                             KafkaException, TIMESTAMP_NOT_AVAILABLE,
                              OFFSET_INVALID, libversion)
 import pytest
 
@@ -9,10 +10,9 @@ def test_basic_api():
     """ Basic API tests, these wont really do anything since there is no
         broker configured. """
 
-    try:
+    with pytest.raises(TypeError) as ex:
         kc = Consumer()
-    except TypeError as e:
-        assert str(e) == "expected configuration dict"
+    assert ex.match('expected configuration dict')
 
     def dummy_commit_cb(err, partitions):
         pass
@@ -55,9 +55,19 @@ def test_basic_api():
     partitions = list(map(lambda part: TopicPartition("test", part), range(0, 100, 3)))
     kc.assign(partitions)
 
+    with pytest.raises(KafkaException) as ex:
+        kc.seek(TopicPartition("test", 0, 123))
+    assert 'Erroneous state' in str(ex.value)
+
     # Verify assignment
     assignment = kc.assignment()
     assert partitions == assignment
+
+    # Pause partitions
+    kc.pause(partitions)
+
+    # Resume partitions
+    kc.resume(partitions)
 
     # Get cached watermarks, should all be invalid.
     lo, hi = kc.get_watermark_offsets(partitions[0], cached=True)
@@ -73,10 +83,10 @@ def test_basic_api():
 
     kc.unassign()
 
-    kc.commit(async=True)
+    kc.commit(asynchronous=True)
 
     try:
-        kc.commit(async=False)
+        kc.commit(asynchronous=False)
     except KafkaException as e:
         assert e.args[0].code() in (KafkaError._TIMED_OUT, KafkaError._NO_OFFSET)
 
@@ -88,6 +98,16 @@ def test_basic_api():
         kc.committed(partitions, timeout=0.001)
     except KafkaException as e:
         assert e.args[0].code() == KafkaError._TIMED_OUT
+
+    try:
+        kc.list_topics(timeout=0.2)
+    except KafkaException as e:
+        assert e.args[0].code() in (KafkaError._TIMED_OUT, KafkaError._TRANSPORT)
+
+    try:
+        kc.list_topics(topic="hi", timeout=0.1)
+    except KafkaException as e:
+        assert e.args[0].code() in (KafkaError._TIMED_OUT, KafkaError._TRANSPORT)
 
     kc.close()
 
@@ -152,7 +172,7 @@ def test_on_commit():
         if cs.once:
             # Try commit once
             try:
-                c.commit(async=False)
+                c.commit(asynchronous=False)
             except KafkaException as e:
                 print('commit failed with %s (expected)' % e)
                 assert e.args[0].code() == KafkaError._NO_OFFSET
@@ -189,8 +209,8 @@ def test_offsets_for_times():
     c.close()
 
 
-def test_multiple_close_throw_exception():
-    """ Calling Consumer.close() multiple times should throw Runtime Exception
+def test_multiple_close_does_not_throw_exception():
+    """ Calling Consumer.close() multiple times should not throw Runtime Exception
     """
     c = Consumer({'group.id': 'test',
                   'enable.auto.commit': True,
@@ -202,10 +222,7 @@ def test_multiple_close_throw_exception():
 
     c.unsubscribe()
     c.close()
-
-    with pytest.raises(RuntimeError) as ex:
-        c.close()
-    assert 'Consumer already closed' == str(ex.value)
+    c.close()
 
 
 def test_any_method_after_close_throws_exception():
@@ -223,47 +240,51 @@ def test_any_method_after_close_throws_exception():
 
     with pytest.raises(RuntimeError) as ex:
         c.subscribe(['test'])
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.unsubscribe()
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.poll()
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.consume()
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.assign([TopicPartition('test', 0)])
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.unassign()
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.assignment()
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.commit()
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.committed([TopicPartition("test", 0)])
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.position([TopicPartition("test", 0)])
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
+
+    with pytest.raises(RuntimeError) as ex:
+        c.seek([TopicPartition("test", 0, 0)])
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         lo, hi = c.get_watermark_offsets(TopicPartition("test", 0))
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
 
 @pytest.mark.skipif(libversion()[1] < 0x000b0000,
@@ -283,8 +304,16 @@ def test_calling_store_offsets_after_close_throws_erro():
 
     with pytest.raises(RuntimeError) as ex:
         c.store_offsets(offsets=[TopicPartition("test", 0, 42)])
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
 
     with pytest.raises(RuntimeError) as ex:
         c.offsets_for_times([TopicPartition("test", 0)])
-    assert 'Consumer closed' == str(ex.value)
+    assert ex.match('Consumer closed')
+
+
+def test_consumer_without_groupid():
+    """ Consumer should raise exception if group.id is not set """
+
+    with pytest.raises(ValueError) as ex:
+        Consumer({'bootstrap.servers': "mybroker:9092"})
+    assert ex.match('group.id must be set')

@@ -21,14 +21,23 @@
 #
 import json
 import logging
+import warnings
 from collections import defaultdict
 
-import requests
+from requests import Session, utils
 
 from .error import ClientError
 from . import loads
 
+# Python 2 considers int an instance of str
+try:
+    string_type = basestring  # noqa
+except NameError:
+    string_type = str
+
 VALID_LEVELS = ['NONE', 'FULL', 'FORWARD', 'BACKWARD']
+VALID_METHODS = ['GET', 'POST', 'PUT', 'DELETE']
+VALID_AUTH_PROVIDERS = ['URL', 'USER_INFO', 'SASL_INHERIT']
 
 # Common accept header sent
 ACCEPT_HDR = "application/vnd.schemaregistry.v1+json, application/vnd.schemaregistry+json, application/json"
@@ -39,19 +48,52 @@ class CachedSchemaRegistryClient(object):
     """
     A client that talks to a Schema Registry over HTTP
 
-    See http://confluent.io/docs/current/schema-registry/docs/intro.html
+    See http://confluent.io/docs/current/schema-registry/docs/intro.html for more information.
+
+    .. deprecated:: 1.1.0
+
+    Use CachedSchemaRegistryClient(dict: config) instead.
+    Existing params ca_location, cert_location and key_location will be replaced with their librdkafka equivalents:
+    `ssl.ca.location`, `ssl.certificate.location` and `ssl.key.location` respectively.
 
     Errors communicating to the server will result in a ClientError being raised.
 
-    @:param: url: url to schema registry
+    :param str|dict url: url(deprecated) to schema registry or dictionary containing client configuration.
+    :param str ca_location: File or directory path to CA certificate(s) for verifying the Schema Registry key.
+    :param str cert_location: Path to client's public key used for authentication.
+    :param str key_location: Path to client's private key used for authentication.
     """
 
-    def __init__(self, url, max_schemas_per_subject=1000):
-        """Construct a client by passing in the base URL of the schema registry server"""
+    def __init__(self, url, max_schemas_per_subject=1000, ca_location=None, cert_location=None, key_location=None):
+        # In order to maintain compatibility the url(conf in future versions) param has been preserved for now.
+        conf = url
+        if not isinstance(url, dict):
+            conf = {
+                'url': url,
+                'ssl.ca.location': ca_location,
+                'ssl.certificate.location': cert_location,
+                'ssl.key.location': key_location
+            }
+            warnings.warn(
+                "CachedSchemaRegistry constructor is being deprecated. "
+                "Use CachedSchemaRegistryClient(dict: config) instead. "
+                "Existing params ca_location, cert_location and key_location will be replaced with their "
+                "librdkafka equivalents as keys in the conf dict: `ssl.ca.location`, `ssl.certificate.location` and "
+                "`ssl.key.location` respectively",
+                category=DeprecationWarning, stacklevel=2)
+
+            """Construct a Schema Registry client"""
+
+        # Ensure URL valid scheme is included; http[s]
+        url = conf.pop('url', '')
+        if not isinstance(url, string_type):
+            raise TypeError("URL must be of type str")
+
+        if not url.startswith('http'):
+            raise ValueError("Invalid URL provided for Schema Registry")
 
         self.url = url.rstrip('/')
 
-        self.max_schemas_per_subject = max_schemas_per_subject
         # subj => { schema => id }
         self.subject_to_schema_ids = defaultdict(dict)
         # id => avro_schema
@@ -59,34 +101,77 @@ class CachedSchemaRegistryClient(object):
         # subj => { schema => version }
         self.subject_to_schema_versions = defaultdict(dict)
 
-    def _send_request(self, url, method='GET', body=None, headers=None):
-        if body:
-            body = json.dumps(body)
-            body = body.encode('utf8')
-        _headers = dict()
-        _headers["Accept"] = ACCEPT_HDR
+        s = Session()
+        ca_path = conf.pop('ssl.ca.location', None)
+        if ca_path is not None:
+            s.verify = ca_path
+        s.cert = self._configure_client_tls(conf)
+        s.auth = self._configure_basic_auth(self.url, conf)
+        self.url = utils.urldefragauth(self.url)
+
+        self._session = s
+
+        self.auto_register_schemas = conf.pop("auto.register.schemas", True)
+
+        if len(conf) > 0:
+            raise ValueError("Unrecognized configuration properties: {}".format(conf.keys()))
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        self._session.close()
+
+    @staticmethod
+    def _configure_basic_auth(url, conf):
+        auth_provider = conf.pop('basic.auth.credentials.source', 'URL').upper()
+        if auth_provider not in VALID_AUTH_PROVIDERS:
+            raise ValueError("schema.registry.basic.auth.credentials.source must be one of {}"
+                             .format(VALID_AUTH_PROVIDERS))
+        if auth_provider == 'SASL_INHERIT':
+            if conf.pop('sasl.mechanism', '').upper() == 'GSSAPI':
+                raise ValueError("SASL_INHERIT does not support SASL mechanism GSSAPI")
+            auth = (conf.pop('sasl.username', ''), conf.pop('sasl.password', ''))
+        elif auth_provider == 'USER_INFO':
+            auth = tuple(conf.pop('basic.auth.user.info', '').split(':'))
+        else:
+            auth = utils.get_auth_from_url(url)
+        return auth
+
+    @staticmethod
+    def _configure_client_tls(conf):
+        cert = conf.pop('ssl.certificate.location', None), conf.pop('ssl.key.location', None)
+        # Both values can be None or no values can be None
+        if bool(cert[0]) != bool(cert[1]):
+            raise ValueError(
+                "Both schema.registry.ssl.certificate.location and schema.registry.ssl.key.location must be set")
+        return cert
+
+    def _send_request(self, url, method='GET', body=None, headers={}):
+        if method not in VALID_METHODS:
+            raise ClientError("Method {} is invalid; valid methods include {}".format(method, VALID_METHODS))
+
+        _headers = {'Accept': ACCEPT_HDR}
         if body:
             _headers["Content-Length"] = str(len(body))
             _headers["Content-Type"] = "application/vnd.schemaregistry.v1+json"
+        _headers.update(headers)
 
-        if headers:
-            for header_name in headers:
-                _headers[header_name] = headers[header_name]
-        if method == 'GET':
-            response = requests.get(url, headers=_headers)
-        elif method == 'POST':
-            response = requests.post(url, body, headers=_headers)
-        elif method == 'PUT':
-            response = requests.put(url, body, headers=_headers)
-        elif method == 'DELETE':
-            response = requests.delete(url, headers=_headers)
-        else:
-            raise ClientError("Invalid HTTP request type")
+        response = self._session.request(method, url, headers=_headers, json=body)
+        # Returned by Jetty not SR so the payload is not json encoded
+        try:
+            return response.json(), response.status_code
+        except ValueError:
+            return response.content, response.status_code
 
-        result = json.loads(response.text)
-        return (result, response.status_code)
-
-    def _add_to_cache(self, cache, subject, schema, value):
+    @staticmethod
+    def _add_to_cache(cache, subject, schema, value):
         sub_cache = cache[subject]
         sub_cache[schema] = value
 
@@ -114,9 +199,10 @@ class CachedSchemaRegistryClient(object):
 
         Multiple instances of the same schema will result in cache misses.
 
-        @:param: subject: subject name
-        @:param: avro_schema: Avro schema to be registered
-        @:returns: schema_id: int value
+        :param str subject: subject name
+        :param schema avro_schema: Avro schema to be registered
+        :returns: schema_id
+        :rtype: int
         """
 
         schemas_to_id = self.subject_to_schema_ids[subject]
@@ -129,7 +215,9 @@ class CachedSchemaRegistryClient(object):
 
         body = {'schema': json.dumps(avro_schema.to_json())}
         result, code = self._send_request(url, method='POST', body=body)
-        if code == 409:
+        if (code == 401 or code == 403):
+            raise ClientError("Unauthorized access. Error code:" + str(code))
+        elif code == 409:
             raise ClientError("Incompatible Avro schema:" + str(code))
         elif code == 422:
             raise ClientError("Invalid Avro schema:" + str(code))
@@ -141,12 +229,68 @@ class CachedSchemaRegistryClient(object):
         self._cache_schema(avro_schema, schema_id, subject)
         return schema_id
 
+    def check_registration(self, subject, avro_schema):
+        """
+        POST /subjects/(string: subject)
+        Check if a schema has already been registered under the specified subject.
+        If so, returns the schema id. Otherwise, raises a ClientError.
+
+        avro_schema must be a parsed schema from the python avro library
+
+        Multiple instances of the same schema will result in inconsistencies.
+
+        :param str subject: subject name
+        :param schema avro_schema: Avro schema to be checked
+        :returns: schema_id
+        :rtype: int
+        """
+
+        schemas_to_id = self.subject_to_schema_ids[subject]
+        schema_id = schemas_to_id.get(avro_schema, None)
+        if schema_id is not None:
+            return schema_id
+        # send it up
+        url = '/'.join([self.url, 'subjects', subject])
+        # body is { schema : json_string }
+
+        body = {'schema': json.dumps(avro_schema.to_json())}
+        result, code = self._send_request(url, method='POST', body=body)
+        if code == 401 or code == 403:
+            raise ClientError("Unauthorized access. Error code:" + str(code))
+        elif code == 404:
+            raise ClientError("Schema or subject not found:" + str(code))
+        elif not 200 <= code <= 299:
+            raise ClientError("Unable to check schema registration. Error code:" + str(code))
+        # result is a dict
+        schema_id = result['id']
+        # cache it
+        self._cache_schema(avro_schema, schema_id, subject)
+        return schema_id
+
+    def delete_subject(self, subject):
+        """
+        DELETE /subjects/(string: subject)
+        Deletes the specified subject and its associated compatibility level if registered.
+        It is recommended to use this API only when a topic needs to be recycled or in development environments.
+        :param subject: subject name
+        :returns: version of the schema deleted under this subject
+        :rtype: (int)
+        """
+
+        url = '/'.join([self.url, 'subjects', subject])
+
+        result, code = self._send_request(url, method="DELETE")
+        if not (code >= 200 and code <= 299):
+            raise ClientError('Unable to delete subject: {}'.format(result))
+        return result
+
     def get_by_id(self, schema_id):
         """
         GET /schemas/ids/{int: id}
         Retrieve a parsed avro schema by id or None if not found
-        @:param: schema_id: int value
-        @:returns: Avro schema
+        :param int schema_id: int value
+        :returns: Avro schema
+        :rtype: schema
         """
         if schema_id in self.id_to_schema:
             return self.id_to_schema[schema_id]
@@ -183,8 +327,9 @@ class CachedSchemaRegistryClient(object):
         This call always contacts the registry.
 
         If the subject is not found, (None,None,None) is returned.
-        @:param: subject: subject name
-        @:returns: (schema_id, schema, version)
+        :param str subject: subject name
+        :returns: (schema_id, schema, version)
+        :rtype: (string, schema, int)
         """
         url = '/'.join([self.url, 'subjects', subject, 'versions', 'latest'])
 
@@ -218,9 +363,10 @@ class CachedSchemaRegistryClient(object):
         Get the version of a schema for a given subject.
 
         Returns None if not found.
-        @:param: subject: subject name
-        @:param: avro_schema: Avro schema
-        @:returns: version
+        :param str subject: subject name
+        :param: schema avro_schema: Avro schema
+        :returns: version
+        :rtype: int
         """
         schemas_to_version = self.subject_to_schema_versions[subject]
         version = schemas_to_version.get(avro_schema, None)
@@ -249,9 +395,10 @@ class CachedSchemaRegistryClient(object):
         Test the compatibility of a candidate parsed schema for a given subject.
 
         By default the latest version is checked against.
-        @:param: subject: subject name
-        @:param: avro_schema: Avro schema
-        @:return: True if compatible, False if not compatible
+        :param: str subject: subject name
+        :param: schema avro_schema: Avro schema
+        :return: True if compatible, False if not compatible
+        :rtype: bool
         """
         url = '/'.join([self.url, 'compatibility', 'subjects', subject,
                         'versions', str(version)])
@@ -267,8 +414,8 @@ class CachedSchemaRegistryClient(object):
             elif code >= 200 and code <= 299:
                 return result.get('is_compatible')
             else:
-                log.error("Unable to check the compatibility")
-                False
+                log.error("Unable to check the compatibility: " + str(code))
+                return False
         except Exception as e:
             log.error("_send_request() failed: %s", e)
             return False
@@ -279,7 +426,7 @@ class CachedSchemaRegistryClient(object):
 
         Update the compatibility level for a subject.  Level must be one of:
 
-        @:param: level: ex: 'NONE','FULL','FORWARD', or 'BACKWARD'
+        :param str level: ex: 'NONE','FULL','FORWARD', or 'BACKWARD'
         """
         if level not in VALID_LEVELS:
             raise ClientError("Invalid level specified: %s" % (str(level)))
@@ -300,18 +447,26 @@ class CachedSchemaRegistryClient(object):
         GET /config
         Get the current compatibility level for a subject.  Result will be one of:
 
-        @:param: subject: subject name
-        @:return: 'NONE','FULL','FORWARD', or 'BACKWARD'
+        :param str subject: subject name
+        :raises ClientError: if the request was unsuccessful or an invalid compatibility level was returned
+        :returns: one of 'NONE','FULL','FORWARD', or 'BACKWARD'
+        :rtype: bool
         """
         url = '/'.join([self.url, 'config'])
         if subject:
-            url += '/' + subject
+            url = '/'.join([url, subject])
 
         result, code = self._send_request(url)
-        if code >= 200 and code <= 299:
-            compatibility = result.get('compatibility', None)
+        is_successful_request = code >= 200 and code <= 299
+        if not is_successful_request:
+            raise ClientError('Unable to fetch compatibility level. Error code: %d' % code)
 
-        if not compatibility:
-            compatibility = result.get('compatibilityLevel')
+        compatibility = result.get('compatibilityLevel', None)
+        if compatibility not in VALID_LEVELS:
+            if compatibility is None:
+                error_msg_suffix = 'No compatibility was returned'
+            else:
+                error_msg_suffix = str(compatibility)
+            raise ClientError('Invalid compatibility level received: %s' % error_msg_suffix)
 
         return compatibility
